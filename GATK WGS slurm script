@@ -1,0 +1,192 @@
+#!/bin/bash -l
+#SBATCH -N 1
+#SBATCH --ntasks-per-node=1
+#SBATCH --time=500:00:00
+#SBATCH --mem=160G
+#SBATCH -p compute
+#SBATCH -o /.%J.%N.out
+#SBATCH -e /.%J.%N.err
+#SBATCH --job-name=WGS_BAM
+
+#######################################   
+## GATK WGS pipeline: Adapted by Laura Budurlean
+
+#load necessary modules
+
+module load gatk
+module load picard
+#module load gatk/4.1.6.0
+#module load picard/2.22.2
+module load bwa/0.7.17
+module load samtools/1.9
+#module load trimmomatic/0.38
+#module load fastqc/0.11.8
+
+
+if [ $# -ne 2 ]
+then
+        #echo "$0 Datafolder Read1 Read2 ExperimentName"
+	echo "$0 Datafolder ExperimentName"
+	exit 0
+fi
+
+dataFolder=$1 
+outfile=$2 0
+
+cwd=`pwd`
+
+#link to necessary files
+#gatkP="/gpfs/ri/shared/modules7/miniconda3/envs/gatk-4.1.6.0/share/gatk4-4.1.6.0-0/gatk"
+picardP="/gpfs/ri/shared/modules7/picard/2.22.2/bin/picard.jar"
+gatkP="/gpfs/ri/shared/modules7/gatk/4.2.6.1/gatk"
+
+#set the location of reference genome and GATK indels and dbSNP files.
+ref="/.../hg38/GRCh38_BWA_Index/GRCh38_full_analysis_set_plus_decoy_hla.fa"
+knowIndel1="/.../GATKBundle/hg38/resources_broad_hg38_v0_Homo_sapiens_assembly38.known_indels.vcf.gz"
+knowIndel2="/.../GATKBundle/hg38/resources_broad_hg38_v0_Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"
+dbSNP146="/.../GATKBundle/hg38/dbsnp_146.hg38.vcf"
+tmpdir="/set/tmp/dir"
+
+#adjust as needed
+threads=44
+
+
+echo -e "$(date)\t$scriptname\t########## STARTING PIPELINE on Sample ${filePrefix} with threads $threads ##########  \n" > time_log
+START_PIPELINE=$(date +%s)
+
+analysisDir=${outfile}_GRCh38_GATK  
+if [ ! -d ${analysisDir} ]
+  then      #create fastqc directory for original read ##########
+    mkdir -p ${analysisDir}
+fi
+
+samplePre=${dataFolder}
+
+for file in `ls ${samplePre}*_R1_*.fastq.gz`
+do
+	Read1=$file #e.g Read1=name_S1_L001_R1_001.fastq.gz
+	tmpR=${Read1%_R1_001.fastq.gz}
+	Read2=${tmpR}_R2_001.fastq.gz
+	filePrefix=$( echo ${Read1} | cut -d '_' -f1)  #name_S1_L001
+done
+###################################################################################################
+
+#### Step 1 Convert FASTQ to uBAM and add read group information using FastqToSam
+
+if [ ! -s ${analysisDir}/${filePrefix}_fastqtosam.bam ]
+	then
+	Read_p1=${filePrefix}_R1_paired.fastq.gz
+	Read_p2=${filePrefix}_R2_paired.fastq.gz
+	Read_p1=$Read1
+	Read_p2=$Read2
+	START1=$(date +%s)
+
+	echo -e "$(date)\t$scriptname\t Step1: Convert FASTQ to uBAM and add read group information using FastqToSam ...\n" >> time_log
+	PU=`zcat $Read_p1 | head -1 | grep "^@"|  cut -d":" -f3,4,10`  #Platform unit:  {FLOWCELL_BARCODE}.{LANE}.{SAMPLE_BARCODE}
+	java -Xmx150g -Djava.io.tmpdir=${tmpdir} -jar ${picardP} FastqToSam FASTQ=${Read_p1} FASTQ2=${Read_p2} OUTPUT=${analysisDir}/${filePrefix}_fastqtosam.bam READ_GROUP_NAME=${filePrefix} SAMPLE_NAME=${filePrefix} LIBRARY_NAME=Lib1 PLATFORM_UNIT=$PU PLATFORM=Illumina SEQUENCING_CENTER=IPM
+fi
+
+#### Step 2 Sort uBAM file by queryname
+
+if [ ! -s ${analysisDir}/${filePrefix}_fastqtosam_sorted.bam ]
+	then
+       java -Xmx150g -Djava.io.tmpdir=${tmpdir} -jar ${picardP} SortSam INPUT=${analysisDir}/${filePrefix}_fastqtosam.bam OUTPUT=${analysisDir}/${filePrefix}_fastqtosam_sorted.bam SORT_ORDER=queryname 
+	else
+			 echo -e "${analysisDir}/${filePrefix}_fastqtosam_sorted.bam exists, Skipping this step." >> time_log
+fi
+
+#### Step 3 Mark adapter sequences using MarkIlluminaAdapters
+
+if [ ! -s ${analysisDir}/${filePrefix}_fastqtosam_markilluminaadapters.bam ]
+	then
+			java -Xmx100G -jar ${picardP} MarkIlluminaAdapters I=${analysisDir}/${filePrefix}_fastqtosam_sorted.bam O=${analysisDir}/${filePrefix}_fastqtosam_markilluminaadapters.bam M=${analysisDir}/${filePrefix}_fastqtosam_markilluminaadapters_metrics.txt TMP_DIR=${tmpdir} #optional to process large files
+  else
+  		echo -e "${analysisDir}/${filePrefix}_fastqtosam_markilluminaadapters.bam exists! Skipping this step." >> time_log
+fi
+
+#### Step 4: Convert BAM to FASTQ and discount adapter sequences using SamToFastq
+
+if [ ! -s ${analysisDir}/${filePrefix}_samtofastq_interleaved.fq ]
+	then
+        	java -Xmx150g -Djava.io.tmpdir=${tmpdir} -jar ${picardP} SamToFastq I=${analysisDir}/${filePrefix}_fastqtosam_markilluminaadapters.bam FASTQ=${analysisDir}/${filePrefix}_samtofastq_interleaved.fq CLIPPING_ATTRIBUTE=XT CLIPPING_ACTION=2 INTERLEAVE=true NON_PF=true TMP_DIR=${tmpdir} #optional to process large files
+	else
+		echo -e "${analysisDir}/${filePrefix}_samtofastq_interleaved.fq exists! Skipping this step." >> time_log
+fi
+
+
+#### Step 5: Align reads and flag secondary hits using BWA-MEM
+
+if [ ! -s ${analysisDir}/${filePrefix}_bwa_mem.sam ]
+	then
+		bwa mem -K 100000000 -p -v 3 -t ${threads} -Y ${ref} ${analysisDir}/${filePrefix}_samtofastq_interleaved.fq > ${analysisDir}/${filePrefix}_bwa_mem.sam
+        else
+		echo -e "${analysisDir}/${filePrefix}_bwa_mem.sam exists! Skipping this step." >> time_log
+fi
+
+#### Step 6: Restore altered data and adjust meta information using MergeBamAlignment
+
+#MergeBamAlignment, unsorted
+if [ ! -s ${analysisDir}/${filePrefix}_mergebamalignment.unsorted.bam ]
+	then
+        	java -Xmx150g -Djava.io.tmpdir=${tmpdir} -jar ${picardP} MergeBamAlignment R=${ref} UNMAPPED_BAM=${analysisDir}/${filePrefix}_fastqtosam_sorted.bam ALIGNED_BAM=${analysisDir}/${filePrefix}_bwa_mem.sam O=${analysisDir}/${filePrefix}_mergebamalignment.unsorted.bam ADD_MATE_CIGAR=true CLIP_ADAPTERS=false EXPECTED_ORIENTATIONS=FR IS_BISULFITE_SEQUENCE=false MAX_INSERTIONS_OR_DELETIONS=-1 PRIMARY_ALIGNMENT_STRATEGY=MostDistant UNMAPPED_READ_STRATEGY=COPY_TO_TAG ALIGNER_PROPER_PAIR_FLAGS=true UNMAP_CONTAMINANT_READS=true ATTRIBUTES_TO_RETAIN=X0 SORT_ORDER="unsorted" ALIGNED_READS_ONLY=false
+	else
+		echo -e "${analysisDir}/${filePrefix}_mergebamalignment.unsorted.bam exists! Skipping this step." >> time_log
+fi
+
+#SortSam, get sorted bam file
+if [ ! -s ${analysisDir}/${filePrefix}_mergebamalignment.sorted.bam ]
+	then
+        	java -Xmx150g -Djava.io.tmpdir=${tmpdir} -jar ${picardP} SortSam INPUT=${analysisDir}/${filePrefix}_mergebamalignment.unsorted.bam OUTPUT=${analysisDir}/${filePrefix}_mergebamalignment.sorted.bam SORT_ORDER="coordinate" CREATE_INDEX=true CREATE_MD5_FILE=false
+	else
+		echo -e "${analysisDir}/${filePrefix}_mergebamalignment.sorted.bam exists! Skipping this step." >> time_log
+fi
+
+#SetNmandUqTags 
+if [ ! -s ${analysisDir}/${filePrefix}_mergebamalignment.sortaddUqTag.bam ]
+	then      
+         	java -Xmx150g -Djava.io.tmpdir=${tmpdir} -jar ${picardP} SetNmAndUqTags INPUT=${analysisDir}/${filePrefix}_mergebamalignment.sorted.bam OUTPUT=${analysisDir}/${filePrefix}_mergebamalignment.sortaddUqTag.bam CREATE_INDEX=true REFERENCE_SEQUENCE=${ref}
+	else
+		echo -e "${analysisDir}/${filePrefix}_mergebamalignment.sortaddUqTag.bam exists! Skipping this step." >> time_log
+fi
+
+
+#### Step 7: Score duplicate sets based on the sum of base qualities using MarkDuplicates
+
+${gatkP} --java-options "-Xmx150G -Djava.io.tmpdir=${tmpdir} -XX:+UseParallelGC -XX:ParallelGCThreads=44" MarkDuplicates -I ${analysisDir}/${filePrefix}_mergebamalignment.sortaddUqTag.bam -O ${analysisDir}/${filePrefix}_markduplicates.bam -M ${analysisDir}/${filePrefix}_markduplicates_metrics.txt --OPTICAL_DUPLICATE_PIXEL_DISTANCE 100 --VALIDATION_STRINGENCY SILENT
+
+#Sort BAM file by coordinate order and fix tag values for NM and UQ
+java -Xmx150g -Djava.io.tmpdir=${tmpdir} -jar ${picardP} SortSam INPUT=${analysisDir}/${filePrefix}_markduplicates.bam OUTPUT=${analysisDir}/${filePrefix}_markduplicates.sort.bam SORT_ORDER="coordinate" CREATE_INDEX=true CREATE_MD5_FILE=false
+java -Xmx150g -Djava.io.tmpdir=${tmpdir} -jar ${picardP} SetNmAndUqTags INPUT=${analysisDir}/${filePrefix}_markduplicates.sort.bam OUTPUT=${analysisDir}/${filePrefix}_mkdup_sort_NM_UQ.bam CREATE_INDEX=true REFERENCE_SEQUENCE=${ref}
+
+
+#### Step 8:BaseRecalibrator and ApplyBQSR
+
+${gatkP} --java-options "-Xmx150G -XX:+UseParallelGC -XX:ParallelGCThreads=44" BaseRecalibrator -I ${analysisDir}/${filePrefix}_mkdup_sort_NM_UQ.bam -R ${ref} --use-original-qualities --known-sites /gpfs/Labs/IPM/refGenomes/GATKBundle/hg38/dbsnp_146.hg38.vcf --known-sites /gpfs/Labs/IPM/refGenomes/GATKBundle/hg38/resources_broad_hg38_v0_Homo_sapiens_assembly38.known_indels.vcf.gz --known-sites /gpfs/Labs/IPM/refGenomes/GATKBundle/hg38/resources_broad_hg38_v0_Mills_and_1000G_gold_standard.indels.hg38.vcf.gz -O ${analysisDir}/${filePrefix}_markduplicates_baseRecal.table --exclude-intervals /gpfs/Labs/IPM/refGenomes/GATKBundle/hg38/wgs_calling_regions.hg38.interval_list 
+${gatkP} --java-options "-Xmx150G -XX:+UseParallelGC -XX:ParallelGCThreads=44" ApplyBQSR -I ${analysisDir}/${filePrefix}_mkdup_sort_NM_UQ.bam -R ${ref} -bqsr ${analysisDir}/${filePrefix}_markduplicates_baseRecal.table -O ${analysisDir}/${filePrefix}_markduplicates_baseBQSRRecal.bam  --static-quantized-quals 10 --static-quantized-quals 20 --static-quantized-quals 30 --use-original-qualities --exclude-intervals /gpfs/Labs/IPM/refGenomes/GATKBundle/hg38/wgs_calling_regions.hg38.interval_list 
+
+
+#### Step 9: HaplotypeCaller
+
+${gatkP} --java-options "-Xmx150G -XX:+UseParallelGC -XX:ParallelGCThreads=44" HaplotypeCaller -I ${analysisDir}/${filePrefix}_markduplicates_baseBQSRRecal.bam -R ${ref} --dbsnp ${dbSNP} --exclude_intervals /gpfs/Labs/IPM/refGenomes/GATKBundle/hg38/wgs_calling_regions.hg38.interval_list --read-filter OverclippedReadFilter -bamout ${analysisDir}/${filePrefix}_hap_hg38_parsed.bam -O ${analysisDir}/${filePrefix}.hg38.hap.g.vcf
+
+#Genotype GVCF
+#Use this if needed
+${gatkP} GenotypeGVCFs -R ${ref} -V ${analysisDir}/${filePrefix}.hg38.hap.g.vcf -O ${analysisDir}/${filePrefix}.hg38.hap.GT.vcf #this is the genotyped GVCF file
+
+
+
+#SAMTOOLS STATS
+
+#samtools flagstat ${analysisDir}/${filePrefix}_mkdup_sort.bam > ${analysisDir}/${filePrefix}.bam.flagstat
+
+#awk '{if(NR==1) printf ("Total Reads: %d\t'${outfile}'\n", $1)}' ${analysisDir}/${filePrefix}.bam.flagstat >> ${analysisDir}/${filePrefix}_report
+#awk '{if(NR==5) printf ("Aligned Reads: %d\t'${outfile}'\n", $1)}' ${analysisDir}/${filePrefix}.bam.flagstat >> ${analysisDir}/${filePrefix}_report
+
+#samtools flagstat ${analysisDir}/${filePrefix}_markduplicates_baseBQSRRecal.bam > ${analysisDir}/${filePrefix}.nodup.bam.flagstat
+#awk '{if(NR==5) printf ("Recalbration Reads: %d\t'${outfile}'\n", $1)}' ${analysisDir}/${filePrefix}.nodup.bam.flagstat >> ${analysisDir}/${filePrefix}_report
+
+END=$(date +%s)
+diff=$(( $END - $START_PIPELINE ))
+hours=$(bc <<<"scale=2;$diff/3600")
+echo -e "$(date)\t$scriptname\tDone pipeline: took $diff seconds, equal to $hours hours\n" >> time_log
+cd $cwd
